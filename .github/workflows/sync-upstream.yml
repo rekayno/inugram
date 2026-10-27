@@ -1,0 +1,308 @@
+name: sync-upstream
+
+on:
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/sync-upstream.yml
+      - .github/workflows/publish-release.yml
+
+permissions:
+  contents: write
+  actions: write
+  issues: write
+
+concurrency:
+  group: sync-upstream-main
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
+    steps:
+      - name: checkout fork
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN || github.token }}
+
+      - name: merge upstream
+        id: merge
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git remote add upstream https://github.com/teidesu/inugram.git 2>/dev/null || true
+          git fetch --no-tags upstream main
+
+          before=$(git rev-parse HEAD)
+          echo "before=$before" >> "$GITHUB_OUTPUT"
+
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Already up to date."
+            exit 0
+          fi
+
+          if ! git merge --no-edit upstream/main; then
+            git diff --name-only --diff-filter=U > "$RUNNER_TEMP/conflicts.txt" || true
+            git merge --abort || true
+
+            # shellcheck disable=SC2016 # markdown backticks, not shell substitution
+            body=$(printf 'Automatic merge of teidesu/inugram@main failed.\n\nConflicting files:\n\n```\n%s\n```\n\nResolve manually:\n\n```sh\ngit fetch upstream\ngit merge upstream/main\n```\n' "$(cat "$RUNNER_TEMP/conflicts.txt")")
+
+            existing=$(gh issue list --state open --search 'Upstream sync conflict in:title' --json number --jq '.[0].number // ""')
+            if [ -n "$existing" ]; then
+              gh issue comment "$existing" --body "$body"
+            else
+              gh issue create --title 'Upstream sync conflict' --body "$body"
+            fi
+
+            echo "::error::merge conflict: $(tr '\n' ' ' < "$RUNNER_TEMP/conflicts.txt")"
+            exit 1
+          fi
+
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      # Keeps the 99-account patch inside the fork without touching the app sources by hand.
+      # The patch is regenerated from the pinned upstream sources plus the fork's own
+      # feature/multi-account.patch, so upstream merges cannot silently drop it.
+      - name: keep the 99-account patch in sync
+        id: accounts
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import os
+          import re
+          import subprocess
+          import tempfile
+          import urllib.request
+
+          REPO = 'https://raw.githubusercontent.com/DrKLO/Telegram'
+          FILES = [
+              'TMessagesProj/jni/tgnet/ConnectionsManager.cpp',
+              'TMessagesProj/jni/tgnet/Defines.h',
+              'TMessagesProj/src/main/java/org/telegram/messenger/UserConfig.java',
+          ]
+          PATCH = 'patches/feature/multi-account-99.patch'
+          SERIES_ENTRY = 'feature/multi-account-99.patch'
+          AFTER = 'feature/multi-account.patch'
+
+          def git(*args):
+              subprocess.run(('git',) + args, check=True, stdout=subprocess.DEVNULL)
+
+          with open('upstream-commit', encoding='utf-8') as handle:
+              commit = handle.read().strip()
+          if not re.fullmatch(r'[0-9a-f]{40}', commit):
+              raise SystemExit(f'invalid upstream-commit: {commit!r}')
+          if not os.path.exists('patches/feature/multi-account.patch'):
+              raise SystemExit('patches/feature/multi-account.patch is missing; upstream layout changed')
+
+          with tempfile.TemporaryDirectory() as tmp:
+              for name in FILES:
+                  path = os.path.join(tmp, name)
+                  os.makedirs(os.path.dirname(path), exist_ok=True)
+                  request = urllib.request.Request(
+                      f'{REPO}/{commit}/{name}',
+                      headers={'User-Agent': 'inugram-fork-ci'},
+                  )
+                  with urllib.request.urlopen(request) as response, open(path, 'wb') as out:
+                      out.write(response.read())
+
+              git('init', '-q', tmp)
+              git('-C', tmp, 'config', 'user.name', 'inugram fork ci')
+              git('-C', tmp, 'config', 'user.email', 'ci@inugram')
+              git('-C', tmp, 'config', 'core.autocrlf', 'false')
+              git('-C', tmp, 'add', '-A')
+              git('-C', tmp, 'commit', '-qm', 'base')
+              git('-C', tmp, 'apply', os.path.abspath('patches/feature/multi-account.patch'))
+              git('-C', tmp, 'add', '-A')
+              git('-C', tmp, 'commit', '-qm', 'multi-account')
+
+              def edit(name, transform):
+                  path = os.path.join(tmp, name)
+                  with open(path, encoding='utf-8', newline='') as handle:
+                      source = handle.read()
+                  updated, count = transform(source)
+                  if count != 1:
+                      raise SystemExit(f'{name}: expected 1 match, got {count}')
+                  with open(path, 'w', encoding='utf-8', newline='') as handle:
+                      handle.write(updated)
+
+              def dynamic_instances(source):
+                  newline = '\r\n' if '\r\n' in source else '\n'
+                  body = newline.join([
+                      'ConnectionsManager& ConnectionsManager::getInstance(int32_t instanceNum) {',
+                      '    static ConnectionsManager *instances[MAX_ACCOUNT_COUNT] = {};',
+                      '    static std::once_flag initFlags[MAX_ACCOUNT_COUNT];',
+                      '    if (instanceNum < 0) {',
+                      '        instanceNum = 0;',
+                      '    } else if (instanceNum >= MAX_ACCOUNT_COUNT) {',
+                      '        instanceNum = MAX_ACCOUNT_COUNT - 1;',
+                      '    }',
+                      '    std::call_once(initFlags[instanceNum], [instanceNum]() {',
+                      '        instances[instanceNum] = new ConnectionsManager(instanceNum);',
+                      '    });',
+                      '    return *instances[instanceNum];',
+                      '}',
+                      '',
+                  ])
+                  return re.subn(
+                      r'ConnectionsManager& ConnectionsManager::getInstance\(int32_t instanceNum\) \{.*?\r?\n\}\r?\n',
+                      lambda _: body,
+                      source,
+                      flags=re.S,
+                  )
+
+              def add_mutex_include(source):
+                  if '#include <mutex>' in source:
+                      return source, 1
+                  return re.subn(r'(#include <memory>\r?\n)', r'\g<1>#include <mutex>' + ('\r\n' if '\r\n' in source else '\n'), source, count=1)
+
+              edit(FILES[0], dynamic_instances)
+              edit(FILES[0], add_mutex_include)
+              edit(FILES[1], lambda source: re.subn(r'#define MAX_ACCOUNT_COUNT\s+\d+', '#define MAX_ACCOUNT_COUNT 99', source))
+              edit(FILES[2], lambda source: re.subn(r'(MAX_ACCOUNT_DEFAULT_COUNT\s*=\s*)\d+', r'\g<1>99', source))
+              edit(FILES[2], lambda source: re.subn(r'(MAX_ACCOUNT_COUNT\s*=\s*)\d+', r'\g<1>99', source))
+
+              diff = subprocess.run(
+                  ('git', '-C', tmp, 'diff'),
+                  check=True, capture_output=True, text=True,
+              ).stdout
+              stat = subprocess.run(
+                  ('git', '-C', tmp, 'diff', '--stat'),
+                  check=True, capture_output=True, text=True,
+              ).stdout
+
+          if not diff.strip():
+              raise SystemExit('the generated 99-account patch is empty')
+
+          header = '\n'.join([
+              'From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001',
+              'From: inugram fork ci <ci@inugram>',
+              'Subject: raise account limit to 99',
+              '',
+              '---',
+              stat.rstrip('\n'),
+              '',
+              '',
+          ])
+
+          try:
+              with open(PATCH, encoding='utf-8', newline='') as handle:
+                  current = handle.read()
+          except FileNotFoundError:
+              current = None
+          if current != header + diff:
+              os.makedirs(os.path.dirname(PATCH), exist_ok=True)
+              with open(PATCH, 'w', encoding='utf-8', newline='') as handle:
+                  handle.write(header + diff)
+              print(f'wrote {PATCH}')
+
+          with open('series', encoding='utf-8') as handle:
+              lines = handle.read().splitlines()
+          if SERIES_ENTRY not in lines:
+              if AFTER not in lines:
+                  raise SystemExit(f'series does not list {AFTER}')
+              lines.insert(lines.index(AFTER) + 1, SERIES_ENTRY)
+              with open('series', 'w', encoding='utf-8', newline='') as handle:
+                  handle.write('\n'.join(lines) + '\n')
+              print(f'added {SERIES_ENTRY} to series')
+          PY
+
+          git add patches/feature/multi-account-99.patch series
+          if git diff --cached --quiet; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git commit -m 'ci: raise the account limit to 99'
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: push
+        if: steps.merge.outputs.changed == 'true' || steps.accounts.outputs.changed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # GITHUB_TOKEN cannot create or update files under .github/workflows.
+          # A fine-grained PAT with Contents + Workflows (read/write) avoids this.
+          if [ -z "${SYNC_TOKEN:-}" ] && git diff --name-only "${{ steps.merge.outputs.before }}" HEAD | grep -q '^\.github/workflows/'; then
+            echo "::error::upstream changed .github/workflows, but GITHUB_TOKEN cannot push workflow files."
+            echo "::error::create a fine-grained PAT with Contents + Workflows (read/write) and save it as the SYNC_TOKEN secret"
+            exit 1
+          fi
+
+          git push origin HEAD:main
+
+      - name: dispatch build when the push event cannot
+        if: (steps.merge.outputs.changed == 'true' || steps.accounts.outputs.changed == 'true') && env.SYNC_TOKEN == ''
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Mirror build.yml's paths-ignore: .github/** and **.md do not trigger a build.
+          run_build=0
+          while IFS= read -r f; do
+            case "$f" in
+              .github/workflows/build.yml) run_build=1; break ;;
+              .github/*) ;;
+              *.md) ;;
+              *) run_build=1; break ;;
+            esac
+          done < <(git diff --name-only "${{ steps.merge.outputs.before }}" HEAD)
+
+          if [ "$run_build" = 1 ]; then
+            gh workflow run build.yml --ref main
+            echo "Dispatched build.yml"
+          else
+            echo "Only docs/workflows changed; no build dispatched."
+          fi
+
+      - name: ensure the first build exists
+        if: steps.merge.outputs.changed != 'true' && steps.accounts.outputs.changed != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # A push that only adds these workflow files is ignored by build.yml,
+          # so kick off one build manually. After that, builds are driven by
+          # upstream merges and normal pushes.
+          existing=$(gh run list \
+            --workflow build.yml \
+            --branch main \
+            --limit 10 \
+            --json databaseId,event \
+            --jq '[.[] | select(.event != "pull_request")][0].databaseId // ""')
+
+
+          if [ -n "$existing" ]; then
+            echo "A build run already exists: $existing"
+            exit 0
+          fi
+
+          gh workflow run build.yml --ref main
+          echo "Dispatched the first build"
+
+      - name: summary
+        if: steps.merge.outputs.changed == 'true' || steps.accounts.outputs.changed == 'true'
+        shell: bash
+        run: |
+          echo "Merged \`teidesu/inugram@main\` into \`${{ github.repository }}@main\`." >> "$GITHUB_STEP_SUMMARY"
+          if [ "${{ steps.accounts.outputs.changed }}" = "true" ]; then
+            echo "Refreshed \`patches/feature/multi-account-99.patch\` (account limit 99)." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
