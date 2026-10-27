@@ -15,6 +15,7 @@ feature/stickers.patch
 debloat/disable-sensitive.patch
 debloat/disable-swipe-to-unarchive.patch
 feature/multi-account.patch
+feature/multi-account-99.patch
 feature/autofill-hints.patch
 bugfix/keyboard-image-paste.patch
 feature/default-delete-for-both.patch
