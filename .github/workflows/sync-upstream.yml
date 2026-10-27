@@ -172,9 +172,22 @@ jobs:
                       return source, 1
                   return re.subn(r'(#include <memory>\r?\n)', r'\g<1>#include <mutex>' + ('\r\n' if '\r\n' in source else '\n'), source, count=1)
 
+              def raise_native_limit(source):
+                  newline = '\r\n' if '\r\n' in source else '\n'
+                  addition = newline.join([
+                      '',
+                      '#undef MAX_ACCOUNT_COUNT',
+                      '#define MAX_ACCOUNT_COUNT 99',
+                  ])
+                  return re.subn(
+                      r'\r?\n#endif\s*$',
+                      lambda _: addition + newline + '#endif' + newline,
+                      source,
+                  )
+
               edit(FILES[0], dynamic_instances)
               edit(FILES[0], add_mutex_include)
-              edit(FILES[1], lambda source: re.subn(r'#define MAX_ACCOUNT_COUNT\s+\d+', '#define MAX_ACCOUNT_COUNT 99', source))
+              edit(FILES[1], raise_native_limit)
               edit(FILES[2], lambda source: re.subn(r'(MAX_ACCOUNT_DEFAULT_COUNT\s*=\s*)\d+', r'\g<1>99', source))
               edit(FILES[2], lambda source: re.subn(r'(MAX_ACCOUNT_COUNT\s*=\s*)\d+', r'\g<1>99', source))
 
