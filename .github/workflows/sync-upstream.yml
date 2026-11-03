@@ -245,6 +245,30 @@ jobs:
           git commit -m 'ci: raise the account limit to 99'
           echo "changed=true" >> "$GITHUB_OUTPUT"
 
+      # UpdateHelper compares the installed versionCode with the build number of the APKs in the
+      # InugramCI channel, while build.yml takes versionCode from vars.INU_BUILD (default 1).
+      # Keep the variable ahead of the channel numbers and strictly increasing between builds.
+      - name: bump INU_BUILD for the in-app updater
+        if: steps.merge.outputs.changed == 'true' || steps.accounts.outputs.changed == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN || github.token }}
+          INU_BUILD_CURRENT: ${{ vars.INU_BUILD }}
+        run: |
+          set -euo pipefail
+
+          current="${INU_BUILD_CURRENT//[^0-9]/}"
+          current="${current:-0}"
+          candidate=$(( $(date -u +%s) / 60 ))
+          next=$(( current + 1 > candidate ? current + 1 : candidate ))
+          echo "INU_BUILD: ${current} -> ${next}"
+
+          if gh variable set INU_BUILD --body "$next"; then
+            echo "INU_BUILD updated"
+          else
+            echo "::warning::could not set INU_BUILD; add 'Variables: Read and write' to SYNC_TOKEN. The in-app updater may keep offering upstream builds."
+          fi
+
       - name: push
         if: steps.merge.outputs.changed == 'true' || steps.accounts.outputs.changed == 'true'
         shell: bash
